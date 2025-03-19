@@ -21,7 +21,7 @@ CREATE TABLE CuocThi (
     MaCuocThi VARCHAR(10) PRIMARY KEY,
     TenCuocThi NVARCHAR(255) NOT NULL,
     MonThi NVARCHAR(100),
-    NgayToChuc DATE,
+    NgayThi DATE,
     MoTa NVARCHAR(500),
     MaGiamKhao INT,
     FOREIGN KEY (MaGiamKhao) REFERENCES GiamKhao(MaGiamKhao)
@@ -488,6 +488,179 @@ END;
 
 EXEC sp_XepGiaiThuong;  -- Xếp giải thưởng theo thứ hạng
 
+
+
+--Xây dựng các trigger 
+--Không cho phép nhập điểm số âm
+CREATE TRIGGER trg_CheckDiemSo
+ON KetQuaThi
+FOR INSERT, UPDATE
+AS
+BEGIN
+    IF EXISTS (SELECT * FROM inserted WHERE DiemSo < 0)
+    BEGIN
+        RAISERROR ('Diem so khong duoc am', 16, 1)
+        ROLLBACK TRANSACTION
+    END
+END;
+
+--Kiểm tra ngày đăng ký không lớn hơn ngày tổ chức cuộc thi
+CREATE TRIGGER trg_CheckNgayDangKy
+ON DangKyThi
+FOR INSERT, UPDATE
+AS
+BEGIN
+    IF EXISTS (
+        SELECT * FROM inserted i
+        JOIN CuocThi c ON i.MaCuocThi = c.MaCuocThi
+        WHERE i.NgayDangKy > c.NgayThi
+    )
+    BEGIN
+        RAISERROR ('Ngay dang ky khong duoc lon hon ngay to chuc', 16, 1)
+        ROLLBACK TRANSACTION
+    END
+END;
+
+--Không cho phép một học sinh đăng ký cùng một cuộc thi hai lần
+CREATE TRIGGER trg_UniqueDangKy
+ON DangKyThi
+FOR INSERT
+AS
+BEGIN
+    IF EXISTS (
+        SELECT MaHocSinh, MaCuocThi FROM inserted
+        INTERSECT
+        SELECT MaHocSinh, MaCuocThi FROM DangKyThi
+    )
+    BEGIN
+        RAISERROR ('Hoc sinh da dang ky cuoc thi nay', 16, 1)
+        ROLLBACK TRANSACTION
+    END
+END;
+
+--Không cho phép nhập số điện thoại trùng lặp trong bảng Giám khảo
+CREATE TRIGGER trg_UniqueSDTGiamKhao
+ON GiamKhao
+FOR INSERT, UPDATE
+AS
+BEGIN
+    IF EXISTS (
+        SELECT SDT FROM inserted
+        INTERSECT
+        SELECT SDT FROM GiamKhao
+    )
+    BEGIN
+        RAISERROR ('So dien thoai giam khao bi trung lap', 16, 1)
+        ROLLBACK TRANSACTION
+    END
+END;
+
+-- Tự động cập nhật giải thưởng cho học sinh đạt điểm cao nhất
+CREATE TRIGGER trg_AutoGiaiThuong
+ON KetQuaThi
+FOR INSERT, UPDATE
+AS
+BEGIN
+    DECLARE @MaCuocThi VARCHAR(10), @MaHocSinh VARCHAR(10), @DiemSo INT;
+    SELECT @MaCuocThi = MaCuocThi, @MaHocSinh = MaHocSinh, @DiemSo = DiemSo FROM inserted;
+    
+    IF @DiemSo = (SELECT MAX(DiemSo) FROM KetQuaThi WHERE MaCuocThi = @MaCuocThi)
+    BEGIN
+        INSERT INTO GiaiThuong (MaCuocThi, MaHocSinh, TenGiai, GiaTri)
+        VALUES (@MaCuocThi, @MaHocSinh, N'Giải Nhất', 500000)
+    END
+END;
+
+-- Không cho phép cập nhật hoặc xóa kết quả thi nếu đã có giải thưởng
+CREATE TRIGGER trg_NoUpdateDeleteKetQuaThi
+ON KetQuaThi
+FOR UPDATE, DELETE
+AS
+BEGIN
+    IF EXISTS (
+        SELECT * FROM deleted d
+        JOIN GiaiThuong g ON d.MaHocSinh = g.MaHocSinh AND d.MaCuocThi = g.MaCuocThi
+    )
+    BEGIN
+        RAISERROR ('Khong the cap nhat/xoa ket qua thi vi da co giai thuong', 16, 1)
+        ROLLBACK TRANSACTION
+    END
+END;
+
+-- Kiểm tra tuổi học sinh không nhỏ hơn 6 tuổi khi đăng ký
+CREATE TRIGGER trg_CheckTuoiHocSinh
+ON HocSinh
+FOR INSERT, UPDATE
+AS
+BEGIN
+    IF EXISTS (
+        SELECT * FROM inserted
+        WHERE DATEDIFF(YEAR, NgaySinh, GETDATE()) < 6
+    )
+    BEGIN
+        RAISERROR ('Hoc sinh phai tren 6 tuoi', 16, 1)
+        ROLLBACK TRANSACTION
+    END
+END;
+
+-- Không cho phép một học sinh tham gia quá 3 cuộc thi cùng lúc
+CREATE TRIGGER trg_LimitSoCuocThi
+ON DangKyThi
+FOR INSERT
+AS
+BEGIN
+    IF EXISTS (
+        SELECT MaHocSinh FROM inserted
+        GROUP BY MaHocSinh
+        HAVING COUNT(MaCuocThi) > 3
+    )
+    BEGIN
+        RAISERROR ('Moi hoc sinh chi duoc tham gia toi da 3 cuoc thi', 16, 1);
+        ROLLBACK TRANSACTION;
+    END
+END;
+
+--Không cho phép một giám khảo chấm nhiều cuộc thi cùng một thời điểm
+CREATE TRIGGER trg_GiamKhaoTimeConflict
+ON CuocThi
+FOR INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF EXISTS (
+        SELECT 1 
+        FROM inserted i
+        JOIN CuocThi c ON i.MaGiamKhao = c.MaGiamKhao
+        WHERE i.NgayThi = c.NgayThi
+        AND i.MaCuocThi <> c.MaCuocThi
+    )
+    BEGIN
+        RAISERROR ('Giam khao dang ban trong khoang thoi gian nay', 16, 1);
+        ROLLBACK TRANSACTION;
+    END
+END;
+
+-- Cập nhật lại xếp hạng khi có thay đổi điểm số
+CREATE TRIGGER trg_UpdateXepHang
+ON KetQuaThi
+FOR INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    WITH XepHangCTE AS (
+        SELECT 
+            MaKetQua,
+            RANK() OVER (PARTITION BY MaCuocThi ORDER BY DiemSo DESC) AS NewXepHang
+        FROM KetQuaThi
+    )
+    UPDATE KetQuaThi
+    SET XepHang = XepHangCTE.NewXepHang
+    FROM KetQuaThi
+    INNER JOIN XepHangCTE ON KetQuaThi.MaKetQua = XepHangCTE.MaKetQua;
+END;
+
 -- Phân quyền truy cập
 
 --Tạo người dùng và phân quyền
@@ -500,7 +673,6 @@ USE QLcuocthiTHPT;
 CREATE USER GiamKhaoUser FOR LOGIN GiamKhaoLogin;
 CREATE USER GiaoVienUser FOR LOGIN GiaoVienLogin;
 CREATE USER HocSinhUser FOR LOGIN HocSinhLogin;
-
 --Phân quyền cụ thể
 
 --Phân quyền cho giám khảo
